@@ -12,14 +12,16 @@ documented more heavily than the rest.
 A normal GAN has a generator `G(z)` and a discriminator `D(x)`.  memoryGAN
 adds a **key/value memory** of `N` slots.  Every slot holds a *key* (a
 unit-norm feature vector produced by an encoder from an image), a *value*
-(whether that feature came from a real or a generated image) and an *age*
-(how long since the slot was last touched).  The discriminator no longer has
-a classification head: it encodes an image to a query `q`, looks up the
-nearest slots, and reports "real" as the similarity-weighted share of those
-slots that are real.  The generator is conditioned on a key sampled from the real
-slots, `G(z, k)`, so each generated image is "about" a remembered feature.
-After every training step the encoder's features for the batch are written
-back into the memory.
+(whether that feature came from a real or a generated image), a *histogram*
+weight `h` (how much data the slot has absorbed) and an *age* (how long
+since the slot was last touched).  Together the slots are a mixture of von
+Mises-Fisher clusters with prior `h`.  The discriminator no longer has a
+classification head: it encodes an image to a query `q` and reports "real"
+as the posterior mass, `h_i * exp(kappa * q.K_i)`, that falls on real slots.
+The generator is conditioned on a real key sampled in proportion to `h`,
+`G(z, k)`, so each generated image is "about" a remembered cluster.  After
+every training step the encoder's features for the batch are written back
+into the memory with one incremental-EM step.
 
 ## 2. Module layout
 
@@ -53,12 +55,12 @@ methods (section 4), not re-implementing an interface.
 
 ```
 nn.Module
- ├── Memory               keys [N,D], values [N], ages [N]  (buffers, no grad)
+ ├── Memory               keys [N,D], values [N], hist [N], ages [N]  (buffers, no grad)
  ├── Encoder              image -> unit-norm feature q  [B,D]
  ├── Generator            (z [B,Z], key [B,D]) -> image
  ├── MemoryDiscriminator  owns one Encoder and one Memory
  │      forward(x)   -> p(real | x)        (differentiable w.r.t. Encoder)
- │      slot_posterior(x) -> p(slot | x)   (used by the generator's MI loss)
+ │      slot_posterior(x) -> p(slot | x)   (diagnostics)
  │      remember(x, is_real)  -> writes encoder features into memory (no grad)
  └── MemoryGAN            owns Generator + MemoryDiscriminator + optimisers
         train_step(real_images) -> dict of scalar losses
@@ -77,74 +79,121 @@ no gradient ever flows into stored keys):
 
 | buffer   | shape  | meaning                                                       |
 |----------|--------|---------------------------------------------------------------|
-| `keys`   | [N, D] | unit-norm feature vectors                                     |
+| `keys`   | [N, D] | unit-norm feature vectors (vMF cluster means)                 |
 | `values` | [N]    | 1.0 = came from a real image, 0.0 = from a generated image    |
+| `hist`   | [N]    | mixture prior: decayed count of the data each slot absorbed   |
 | `ages`   | [N]    | write calls since the slot was last touched; large = stale    |
 
 Initialisation: random unit-norm keys, first half of the slots real, second
-half fake, all ages 0.  The paper does the same; it just means the memory is
-"full of noise" at the start and gets overwritten by real features quickly.
+half fake, `hist = 1e-5` everywhere (as in the authors' code), all ages 0.
+The tiny histogram means the first writes dominate it, so the random keys
+are overwritten or never sampled.
 
 Methods, split into two groups.  **Group A is the storage/lookup primitive
 set; a quantum memory overrides these.  Group B is built only from group A
-plus the `values`/`ages` buffers and should not need to change.**  `values`
-and `ages` must stay ordinary tensors; only `keys` may change representation.
+plus the `values`/`hist` buffers and should not need to change.**  `values`,
+`hist` and `ages` must stay ordinary tensors; only `keys` may change
+representation.
 
 Group A – storage and lookup primitives
 * `similarity(q) -> [B, N]`  cosine similarity of each query to every key.
   This is the *only* place the distance metric lives.  It must stay on the
-  cosine scale (or `kappa` is retuned) and be differentiable w.r.t. `q`: the
-  encoder trains only through the posteriors.
+  cosine scale (or `kappa` is retuned) and be differentiable w.r.t. `q`.
 * `lookup(q, k) -> (indices [B,k], sims [B,k])`  top-k slots by `similarity`,
   sorted best first; `sims` carries the gradient, `indices` does not.
 * `read_keys(indices) -> [n, D]`  classical copies of stored keys; the only
   way keys leave the memory (the generator consumes them).
 * `write(q [B,D], is_real [B] bool)`  one call per step, rows handled
-  sequentially.  For each row: if one of its top-k slots has the same label,
-  `_merge` into the nearest such slot (sum, renormalise, age 0); otherwise
-  `_replace` the oldest slot (random tie-break) with the key and label.
-  After all rows, age every slot by 1.  This is the paper's memory update
-  rule.  `write` carries no gradient and runs only after both `backward()`
-  calls.
+  sequentially.  For each row with label `y`: score every slot by
+  `kappa*q.K + log(h + beta)`, minus `2*kappa` for the wrong label, and take
+  the top-`neighbours` candidates.  If even the best candidate has the wrong
+  label, `_replace` the oldest slot (random tie-break) with the query, its
+  label and the mean histogram.  Otherwise `_update` runs one incremental-EM
+  step on the same-label candidates: with `h_hat = alpha*h`,
+  responsibilities `gamma = softmax(kappa*q.K + log h_hat)`, then
+  `h <- h_hat + gamma` and `K <- normalise(K + (gamma/h)(q - K))`, ages
+  reset.  After all rows, age every slot by 1.  This is Sec. 3.1 of the
+  paper and the authors' code.  `write` carries no gradient and runs only
+  after both `backward()` calls.
+
+  History: the first version merged if *any* of the top-16 slots matched
+  (almost always true, so nothing was replaced and the memory stayed at its
+  random initialisation).  The second used the single nearest slot (Kaiser
+  et al. 2017) with uniform key sampling; that filled the memory but reached
+  a Fréchet distance of ~200 at best.  The EM update with the histogram
+  prior reached ~50 (section 5).
+
+  Caveat (measured): with this update all live keys collapse.  Each EM step
+  moves all 128 same-label candidates toward the query by the same fraction
+  `gamma/(alpha*h + gamma)`, close to 1 while `h` is small, so after a few
+  steps the 128 live real keys are one vector and the 128 live fake keys
+  another.  The cosine discriminator then acts as a linear real/fake head and
+  the model trains as an ordinary GAN that ignores its key.  A discriminator
+  that needs distinct keys (the QAE neighbour count in `memorygan_qae.ipynb`)
+  fails on it; the notebook runs that model on the nearest-slot rule instead.
 
 Group B – what the GAN asks of the memory
-* `real_logit(q) -> [B]`  log-odds of real: the paper's vMF mixture over
-  *all* slots, `logsumexp(kappa*sims[real]) - logsumexp(kappa*sims[fake])`.
-  Dense rather than top-k so a query whose neighbours are all fake still
-  gets a gradient toward the nearest real slot.  `real_posterior` is its
-  sigmoid.
-* `slot_posterior(q) -> [B, N]`  `p(slot | q)` over all slots, for the
-  mutual-information term that ties generated images to their key.
-* `sample_real_keys(n) -> (keys [n,D], indices [n])`  uniform over slots
-  whose value is 1, read out via `read_keys`; what the generator is
+* `real_logit(q) -> [B]`  log-odds of real: the posterior mass of the vMF
+  mixture, `p(i|q) ~ h_i exp(kappa q.K_i)`, on real slots, squashed into
+  `[eps, 1-eps]` (paper: 0.001).  By default (`dense=False`, as in the
+  authors' code) the sum runs over the top-k slots by posterior score.  The
+  earlier version of this repo used all slots (`dense=True`), so that a
+  query whose neighbours are all fake still gets a gradient toward the
+  nearest real slot.  With the EM memory that trained worse (Fréchet 85 vs
+  47 at 3000 steps; the discriminator ended at chance), so top-k is the
+  default and the contract test
+  `test_real_logit_has_gradient_when_neighbours_all_fake` is skipped for it.
+  `real_posterior` is its sigmoid.
+* `slot_posterior(q) -> [B, N]`  `p(slot | q)` over all slots (diagnostics).
+* `sample_real_keys(n) -> (keys [n,D], indices [n])`  real slots drawn in
+  proportion to `hist`, read out via `read_keys`; what the generator is
   conditioned on.
 
-`kappa` (sharpness) and `k` (neighbours) are constructor arguments.
+`kappa` (sharpness), `k` (neighbours), `alpha`, `beta`, `eps` and `dense`
+are constructor arguments; `MemoryGANConfig` sets them.
 
 ## 5. Training step (MemoryGAN.train_step)
 
 ```
-real  -> q_real = Enc(real)
-keys, idx = memory.sample_real_keys(B);  z ~ N(0, I)
+keys, _ = memory.sample_real_keys(B);  z ~ N(0, I)
 fake  = G(z, keys)
+MI(x, keys) = -kappa * mean(keys . Enc(x))          # paper's memory-conditional term
 
 D step:  L_D = BCE_logits(D(real), 1) + BCE_logits(D(fake.detach()), 0)
-G step:  L_G = BCE_logits(D(fake), 1) + mi_weight * NLL(slot_posterior(fake), idx)
+              + mi_weight * MI(fake.detach(), keys)
+G step:  L_G = BCE_logits(D(fake), 1) + mi_weight * MI(fake, keys)
 D.remember(real, fake)                   # single write, after both backwards
 ```
 
-Standard non-saturating GAN loss.  The MI term (paper's "memory-conditional"
-loss) is one line, updates the generator only, and has a weight you can set
-to 0.  Invariant: the memory is written exactly once per step, after both
-`backward()` calls, so `idx` stays valid and no in-place/autograd clash can
-occur.  `MemoryGAN` never calls `memory.write` itself; all writes go through
+Standard non-saturating GAN loss.  The MI term is the vMF log-likelihood of
+each generated image's feature under the cluster of the key it was
+conditioned on (a lower bound on the mutual information between key and
+image).  It trains both sides, as in the paper's Eq. 7.  On the generator
+only, the encoder had no reason to tell images apart and its features
+collapsed (cosine ~0.99 between different digits).  Invariant: the memory is
+written exactly once per step, after both `backward()` calls.  `MemoryGAN`
+never calls `memory.write` itself; all writes go through
 `MemoryDiscriminator.remember`.
 
-Observed on CPU, 500 steps, 0.1 s/step: with a top-k posterior the
-discriminator loss collapsed to ~0.01 (the generator got zero gradient once
-its neighbours were all fake); with the dense posterior the losses stay
-balanced (D ~0.3-0.7, G ~1-2).  Samples are still noise at 500 steps,
-which is expected; nothing here is tuned.
+Hyper-parameters (`MemoryGANConfig`) follow the paper's MNIST setup: key
+size 256, 4096 slots, k = 128, conv width 64, lr 2e-4, Adam (0.5, 0.999),
+batch 64, `mi_weight` (lambda) 0.01.  Two were tuned on MNIST, one seed per
+setting, scored by Fréchet distance / Inception-style score in a small MNIST
+classifier's feature space (1500 steps unless noted):
+
+| change from the paper                     | Fréchet / IS |
+|-------------------------------------------|--------------|
+| as published (kappa = 1, z dim = 2)       | 675 / 3.1    |
+| kappa = 10                                | 453 / 4.3    |
+| z dim = 16 (kappa = 1)                    | 216 / 4.1    |
+| kappa = 10 and z dim = 16 (default)       | 61 / 6.1     |
+| ... same, 3000 steps                      | 47 / 6.4     |
+| ... same, 3000 steps, dense posterior     | 85 / 5.9     |
+
+For comparison, the earlier nearest-slot memory reached 206 / 4.2 at its best
+`mi_weight`.  Things tried that did not help: lambda 0.1 or 1 (the MI term
+overpowers the adversarial loss: 218, and collapse at 1), instance noise on
+D's inputs (354), z dim 64 (87).
 
 ## 6. Generation
 
